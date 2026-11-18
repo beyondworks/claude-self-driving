@@ -1,0 +1,11 @@
+{
+  "supervisor_session": "",
+  "dispatcher_session": "",
+  "roles": {},
+  "driver_ssh": "",
+  "result_dir": "~/self-driving-results",
+  "model": "",
+  "effort": "",
+  "away_file": "",
+  "lock_file": "~/.claude/self-driving.lock"
+}
