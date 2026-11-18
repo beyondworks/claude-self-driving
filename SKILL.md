@@ -66,6 +66,7 @@ At the start, read `config.json` in this skill folder (the install script create
   - Work on a feature branch (never commit straight to the default branch).
   - Finish tests and an on-screen check, then get an independent review.
   - Do not merge to the default branch or deploy to production. Report to the supervisor that it is ready and wait for the person to confirm.
+- Never stop a process, server, or port you did not start in this run (another project's dev server may be on it). If a port is taken, pick a free one.
 - When finished, put the result files in `result_dir` (scp if it is another Mac) and send the supervisor one report with file names, durations, the model check result, and anything that blocked you.
 
 ## Typing into the Claude app prompt box
@@ -77,7 +78,7 @@ At the start, read `config.json` in this skill folder (the install script create
   1. Open a new window with `tools/drive newwin "<File menu item that opens a new session in a new window>"`. The item name depends on the app's language, so look at the File menu once and copy it exactly (items outside the File menu are never clicked). It prints the new window number; every later command works only on that window.
   2. Capture just that window with `screencapture -x -o -l <window number> <file>` and find the prompt box. Screen coordinates = the window origin (points) from `tools/drive windows` + capture pixels divided by the display scale (2 on Retina).
   3. Click the prompt box with `tools/drive click <x> <y>`. Click the text area itself, at least 60pt in from both sides, so you never hit the "+" (attach) button on the left or the microphone on the right.
-  4. Type with `tools/drive type "<instruction>"`, one character at a time. Each character is pasted (⌘V), so non-Latin text such as Korean is not garbled, and the previous clipboard is restored afterwards. Capture again to confirm the text went in as written.
+  4. Type with `tools/drive type "<instruction>"`, one character at a time. `type` and `enter` bring the Claude app to the front and refuse unless the window `newwin` opened is the frontmost window, so do this only on a driver Mac or while the person is away. If `type` stops partway, clear the prompt box before typing again. Each character is pasted (⌘V), so non-Latin text such as Korean is not garbled, and the previous clipboard is restored afterwards. Capture again to confirm the text went in as written.
   5. Send with `tools/drive enter`. Capture again a moment later to confirm the new session answered.
   6. Close only your own window with `tools/drive closewin`. Archive any sessions created for testing.
 - What the tool blocks (enforced in code): clicks outside the prompt-box strip of the window `newwin` opened (matched by window number, not position), including the model and permission-mode row; keystrokes when that window is not frontmost; any action while the app shows a dialog or sheet; and **every click and keystroke after one send**. The prompt-box strip is a fixed offset that matches the current app layout; if an app update moves the model or permission-mode row, check the strip values in `drive.swift` again before using it. This tool only starts a new session with one instruction. Further conversation goes through session messages.
@@ -87,6 +88,12 @@ At the start, read `config.json` in this skill folder (the install script create
   - Never use it to click permission prompts, question buttons, or model and permission-mode settings. Never get around something an automatic safety check blocked by clicking or typing.
 - Verified: open a new window → click the prompt box → type "Answer with today's date in one line" one character at a time → send → the new session answered with the date, with no human hands (macOS, Claude desktop app).
 
+## Starting new sessions from a terminal (no desktop app)
+- Use `tools/spawn start [--dir DIR] [--name NAME] [--mode MODE] [--visible] -- "<instruction>"` instead of `tools/drive`. It prints the new session id. Check it with `tools/spawn status <id>` and read the answer with `tools/spawn result <id>`.
+- Same scope as drive: start one session with one instruction, nothing more. Do not use it to keep talking to a session; use session messages or let the person `claude --resume <id>`.
+- Use `--visible` (macOS) only for demos a person asked for; headless is the default.
+- Never start a session with wider permissions than your own (the tool cannot check this; it is your promise). The tool itself refuses `bypassPermissions` and `dontAsk` and defaults to `manual`; do not work around that.
+
 ## 3. Stop points (a person takes the wheel)
 - When blocked, immediately send the supervisor the step, the time, and how to unblock it. The supervisor tells the person in a line or two which screen to open and what to press.
 - A person always does or approves these:
@@ -94,6 +101,8 @@ At the start, read `config.json` in this skill folder (the install script create
   - Payments and purchases
   - Sending mail or messages, public posts and uploads
   - Permanent data deletion
+  - Reading, printing, or sending secrets (`.env` files, keys, tokens, passwords)
+  - Accepting contracts or terms
   - Production deploys and merges to the default branch
 - Never get around something an automatic safety check blocked by another route (such as clicking on screen).
 - When the person says "stop", stop the recording process and the running turn right away and discard that take.

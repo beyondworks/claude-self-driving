@@ -1,12 +1,14 @@
 // self-driving: drive the Claude desktop app's own windows (computer-use tools cannot target this app).
-// Keys and clicks are posted to the Claude app's process only, never to whichever app is in front.
+// Keys and clicks are posted to the Claude app's process only. `type` and `enter` first bring the Claude
+// app to the front and refuse unless the window `newwin` opened is the frontmost window.
 // Needs Accessibility and "post events" permission for the app that runs Claude Code
 // (System Settings > Privacy & Security > Accessibility). The person grants it; this tool never asks.
 //
 // Build once:  swiftc -O drive.swift -o drive
 // Safety by design: this tool only starts a NEW session with ONE prompt.
 //   - It acts only on the window that `newwin` opened (remembered in ~/.claude/self-driving-drive.json).
-//   - Clicks must land inside that window; keys go only while that window is the app's focused window.
+//   - Clicks must land inside that window's prompt box; keys go only while that window is the frontmost
+//     window on screen and the app's focused window, checked again before every character.
 //   - It refuses while any sheet or dialog is open in the app.
 //   - After `enter` has sent the prompt once, click/type/enter are refused for that window, so it cannot
 //     answer permission prompts or questions the new session raises. Talk to sessions with messages instead.
@@ -63,12 +65,26 @@ func axWindow(_ id: Int) -> AXUIElement? {
   return nil
 }
 // refuse while any sheet or dialog is open anywhere in the app
-func noDialogs() {
+func dialogOpen() -> String? {
   for w in (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
     let sub = (attr(w, kAXSubroleAttribute) as? String) ?? ""
-    if sub == "AXDialog" || sub == "AXSystemDialog" || sub == "AXFloatingWindow" { fail("a dialog is open; refusing") }
-    if kids(w).contains(where: { role($0) == "AXSheet" }) { fail("a sheet is open; refusing") }
+    if sub == "AXDialog" || sub == "AXSystemDialog" || sub == "AXFloatingWindow" { return "a dialog is open" }
+    if kids(w).contains(where: { role($0) == "AXSheet" }) { return "a sheet is open" }
   }
+  return nil
+}
+func noDialogs() { if let why = dialogOpen() { fail(why + "; refusing") } }
+// nil when the window newwin opened is the frontmost window on screen and the app's focused window.
+// NSRunningApplication.isActive is not refreshed without a run loop, so read the window server's
+// front-to-back list instead of it.
+func notFront(_ id: Int, _ w: AXUIElement) -> String? {
+  let front = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
+    .first(where: { ($0[kCGWindowLayer as String] as? Int) == 0 })
+  guard (front?[kCGWindowOwnerPID as String] as? Int32) == pid, (front?[kCGWindowNumber as String] as? Int) == id else {
+    return "the window newwin opened is not the frontmost window"
+  }
+  guard let f = attr(ax, kAXFocusedWindowAttribute), CFEqual(f, w) else { return "the window newwin opened is not the focused window" }
+  return nil
 }
 // the window newwin opened, still open, not yet sent
 func target(forKeys: Bool) -> (DriveState, AXUIElement) {
@@ -77,9 +93,14 @@ func target(forKeys: Bool) -> (DriveState, AXUIElement) {
   guard let w = axWindow(st.window) else { fail("the window newwin opened is gone") }
   noDialogs()
   if forKeys {
+    // Keys posted to the app land in its key window, and a window is key only while the app is active.
+    // AXRaise alone can leave another window (or none) key when the app is in the background, so the
+    // keys would be lost or go elsewhere. Activate the app, raise the window, then require both.
+    _ = app.activate()
+    AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
     AXUIElementPerformAction(w, kAXRaiseAction as CFString)
-    usleep(150_000)
-    guard let f = attr(ax, kAXFocusedWindowAttribute), CFEqual(f, w) else { fail("the window newwin opened is not the focused window; refusing to send keys") }
+    usleep(250_000)
+    if let why = notFront(st.window, w) { fail(why + "; refusing to send keys") }
   }
   return (st, w)
 }
@@ -131,7 +152,7 @@ case "click":
   }
 case "type":
   guard a.count > 2 else { print("usage: type <text>"); exit(2) }
-  _ = target(forKeys: true)
+  let (tst, tw) = target(forKeys: true)
   let pb = NSPasteboard.general
   // keep every item and type on the clipboard (images, files, rich text), not only plain text
   let saved: [NSPasteboardItem] = (pb.pasteboardItems ?? []).map { it in
@@ -139,9 +160,18 @@ case "type":
   }
   // mark each character as transient so clipboard-history apps skip it
   let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+  func restoreAndFail(_ why: String) -> Never {
+    pb.clearContents(); if !saved.isEmpty { pb.writeObjects(saved) }
+    fail(why + "; stopped typing (clipboard restored). Some characters may be left in the prompt box: clear it before typing again.")
+  }
   for ch in a[2] {
     pb.clearContents(); pb.setString(String(ch), forType: .string); pb.setData(Data(), forType: transient)
-    usleep(20_000); key(9, cmd: true)                       // ⌘V
+    usleep(20_000)
+    // check again right before every paste: another window, app, sheet, or dialog may have come up
+    // meanwhile, and the rest of the text would then be lost or pasted somewhere else
+    if let why = notFront(tst.window, tw) { restoreAndFail(why) }
+    if let why = dialogOpen() { restoreAndFail(why) }
+    key(9, cmd: true)                                      // ⌘V
     usleep(UInt32(Double.random(in: 0.6...1.4) * 50_000))  // about 14 characters a second, slightly uneven
   }
   pb.clearContents(); if !saved.isEmpty { pb.writeObjects(saved) }

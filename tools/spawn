@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# self-driving: start a new Claude Code session from the terminal, with one instruction.
+# This is the terminal counterpart of tools/drive. It needs no desktop app and no Accessibility permission.
+#
+#   spawn start [--dir DIR] [--name NAME] [--mode MODE] [--visible] -- "<instruction>"
+#       Starts one new session in DIR (default: current folder) and prints its session id.
+#       Default: headless (`claude -p`), works anywhere Claude Code runs (macOS, Linux).
+#       --visible (macOS only): opens a new Terminal window running the interactive session instead,
+#       so a person can watch it work.
+#       --mode: permission mode for the new session (acceptEdits, auto, manual, plan). Default: manual,
+#       passed explicitly (never your settings' defaultMode). bypassPermissions and dontAsk are refused
+#       on purpose. deny rules always apply.
+#   spawn status ID     running | done | failed
+#   spawn result ID     the new session's final answer (headless sessions only)
+#   spawn list          sessions started by this tool
+#
+# Safety by design, same scope as tools/drive:
+#   - It only STARTS a session with ONE instruction. It never types into, answers, or approves anything
+#     in a running session. Further conversation goes through session messages or `claude --resume ID`.
+#   - The instruction never goes through a shell string, and an instruction starting with "-" is refused,
+#     so it can be read neither as a command nor as a claude option. Headless sessions get it on stdin.
+#   - It does not stop or kill sessions; a person (or the session itself) does that.
+set -euo pipefail
+
+STATE_DIR="${SELF_DRIVING_SPAWN_DIR:-$HOME/.claude/self-driving-spawn}"
+# No bypassPermissions or dontAsk: a new session must never get wider permissions than the one starting it.
+MODES="acceptEdits auto manual plan"
+
+die() { echo "$*" >&2; exit 2; }
+need_claude() { command -v claude >/dev/null 2>&1 || die "claude (Claude Code CLI) is not on PATH"; }
+valid_id() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "not a session id: $1"; }
+
+cmd_start() {
+  local dir="$PWD" name="" mode="" visible=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) dir="${2:?--dir needs a folder}"; shift 2 ;;
+      --name) name="${2:?--name needs a value}"; shift 2 ;;
+      --mode) mode="${2:?--mode needs a value}"; shift 2 ;;
+      --visible) visible=1; shift ;;
+      --) shift; break ;;
+      *) die "unknown option: $1 (put the instruction after --)" ;;
+    esac
+  done
+  [ $# -eq 1 ] || die "give exactly one instruction after --"
+  local prompt="$1"
+  [ -n "${prompt// /}" ] || die "the instruction is empty"
+  local lead="${prompt#"${prompt%%[![:space:]]*}"}"
+  [ "${lead:0:1}" != "-" ] || die "the instruction must not start with \"-\" (it would be read as a claude option)"
+  [ -d "$dir" ] || die "no such folder: $dir"
+  dir="$(cd "$dir" && pwd)"
+  if [ -n "$mode" ] && ! [[ " $MODES " == *" $mode "* ]]; then die "unknown permission mode: $mode"; fi
+  [[ "$name" =~ ^[A-Za-z0-9\ ._-]{0,60}$ ]] || die "name: letters, digits, space, . _ - only (60 max)"
+  need_claude
+
+  local id; id="$(uuidgen | tr 'A-Z' 'a-z')"
+  local run="$STATE_DIR/$id"; mkdir -p "$run"; chmod 700 "$STATE_DIR" "$run"
+  local args=(--session-id "$id")
+  [ -n "$name" ] && args+=(--name "$name")
+  # Always pass a mode: left out, claude would use settings.json defaultMode, which may be bypassPermissions.
+  args+=(--permission-mode "${mode:-manual}")
+  printf '%s\n' "$dir" > "$run/dir"
+  printf '%s\n' "$prompt" > "$run/prompt"
+
+  if [ "$visible" -eq 1 ]; then
+    [ "$(uname)" = Darwin ] || die "--visible needs macOS Terminal; run without it for a headless session"
+    # Write a launcher whose arguments are quoted by bash itself (printf %q), so nothing in the
+    # instruction is ever parsed as shell code; Terminal only runs this file.
+    local launch="$run/launch.command"
+    {
+      echo '#!/usr/bin/env bash'
+      printf 'cd %q || exit 1\n' "$dir"
+      printf 'exec claude'; printf ' %q' "${args[@]}"; printf ' -- %q\n' "$prompt"
+    } > "$launch"
+    chmod 700 "$launch"
+    echo visible > "$run/kind"
+    open -a Terminal "$launch"
+  else
+    echo headless > "$run/kind"
+    # Detach the whole runner (not only claude) from this shell, so the exit file is still written after
+    # the caller's shell or tool call ends. The instruction goes in on stdin, never as an argument.
+    nohup bash -c 'cd "$1" || exit 1; shift; run="$1"; shift; claude -p "$@" --output-format json < "$run/prompt" > "$run/out.json" 2> "$run/err.log"; echo $? > "$run/exit"' \
+      spawn-runner "$dir" "$run" "${args[@]}" >/dev/null 2>&1 < /dev/null &
+    echo $! > "$run/pid"
+  fi
+  echo "$id"
+}
+
+cmd_status() {
+  valid_id "${1:-}"; local run="$STATE_DIR/$1"; [ -d "$run" ] || die "unknown session: $1"
+  if [ "$(cat "$run/kind")" = visible ]; then echo "visible (watch its Terminal window; resume with: claude --resume $1)"; return; fi
+  if [ -f "$run/exit" ]; then [ "$(cat "$run/exit")" = 0 ] && echo done || echo failed; return; fi
+  # no exit file: trust a finished JSON result first, then a live runner process
+  if [ -s "$run/out.json" ] && command -v python3 >/dev/null 2>&1 && \
+     python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("is_error") is False else 3)' "$run/out.json" 2>/dev/null; then
+    echo done; return
+  fi
+  local pid; pid="$(cat "$run/pid" 2>/dev/null || true)"
+  if [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q spawn-runner; then echo running; else echo failed; fi
+}
+
+cmd_result() {
+  valid_id "${1:-}"; local run="$STATE_DIR/$1"; [ -d "$run" ] || die "unknown session: $1"
+  [ "$(cat "$run/kind")" = headless ] || die "visible sessions have no captured result; resume with: claude --resume $1"
+  [ -f "$run/exit" ] || [ -s "$run/out.json" ] || die "still running"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result",""))' "$run/out.json" 2>/dev/null || cat "$run/out.json"
+  else cat "$run/out.json"; fi
+  if [ -f "$run/exit" ] && [ "$(cat "$run/exit")" != 0 ]; then echo "--- stderr ---"; tail -n 20 "$run/err.log"; fi
+}
+
+cmd_list() {
+  [ -d "$STATE_DIR" ] || return 0
+  for run in "$STATE_DIR"/*/; do
+    [ -d "$run" ] || continue
+    local id; id="$(basename "$run")"
+    printf '%s  %-8s  %s\n' "$id" "$(cat "$run/kind" 2>/dev/null)" "$(head -c 60 "$run/prompt" 2>/dev/null | tr '\n' ' ')"
+  done
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  result) shift; cmd_result "$@" ;;
+  list) cmd_list ;;
+  *) echo "usage: spawn start [--dir DIR] [--name NAME] [--mode MODE] [--visible] -- \"<instruction>\" | status ID | result ID | list"; exit 2 ;;
+esac
